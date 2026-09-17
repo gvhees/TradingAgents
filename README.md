@@ -110,7 +110,13 @@ conda create -n tradingagents python=3.12
 conda activate tradingagents
 ```
 
-Install the package and its dependencies:
+Or with [uv](https://docs.astral.sh/uv/):
+```bash
+uv venv --python 3.12
+source .venv/bin/activate
+```
+
+Install the package and its dependencies (`uv pip install .` with uv):
 ```bash
 pip install .
 ```
@@ -122,6 +128,8 @@ Alternatively, run with Docker:
 cp .env.example .env  # add your API keys
 docker compose run --rm tradingagents
 ```
+
+After updating the repository, rebuild the image with `docker compose build`.
 
 For local models with Ollama:
 ```bash
@@ -168,7 +176,7 @@ Launch the interactive CLI:
 tradingagents          # installed command
 python -m cli.main     # alternative: run directly from source
 ```
-You will see a screen where you can select your desired tickers, analysis date, LLM provider, research depth, and more.
+You will see a screen where you can select your desired tickers, analysis date, LLM provider, research depth, and more. Your previous run's answers come back as the defaults, so pressing Enter accepts them. The `TRADINGAGENTS_*` variables in `.env` still skip their step entirely.
 
 ### Markets and tickers
 
@@ -211,7 +219,7 @@ from tradingagents.default_config import DEFAULT_CONFIG
 ta = TradingAgentsGraph(debug=True, config=DEFAULT_CONFIG.copy())
 
 # forward propagate
-_, decision = ta.propagate("NVDA", "2026-01-15")
+_, decision = ta.propagate("NVDA", "2026-09-01")
 print(decision)
 ```
 
@@ -228,11 +236,48 @@ config["quick_think_llm"] = "gpt-5.6-luna" # Model for quick tasks
 config["max_debate_rounds"] = 2
 
 ta = TradingAgentsGraph(debug=True, config=config)
-_, decision = ta.propagate("NVDA", "2026-01-15")
+_, decision = ta.propagate("NVDA", "2026-09-01")
 print(decision)
 ```
 
 See `tradingagents/default_config.py` for all configuration options.
+
+### Fundamentals as filed
+
+US company statements can come from SEC EDGAR, which records the date every figure was filed. A run dated in the past then reads the statements exactly as they stood that day: a fiscal year that has ended but has not been filed yet is not served, and a figure restated later still reads as first reported. Apple's 2008 total assets were filed as $39.6B and restated to $36.2B in 2010, and a run dated in between gets $39.6B.
+
+EDGAR needs no account or API key. Add the vendor to the chain:
+
+```python
+config["data_vendors"]["fundamental_data"] = "sec_edgar,yfinance"
+```
+
+SEC asks callers to identify themselves and refuses requests that carry no contact address, so a default one is sent. Set your own so SEC can reach you rather than the project:
+
+```bash
+SEC_EDGAR_USER_AGENT="Your Name your@email.com"
+```
+
+It covers companies that file with the SEC, including foreign companies listed in the US. Anything else, such as Hong Kong or A-share listings, falls through to the next vendor in the chain. EDGAR's machine-readable filings begin in 2009, and a fourth quarter is reported as unavailable rather than derived, because filers publish it only inside the annual figure.
+
+### Current holdings
+
+By default the agents do not know what you hold, so their guidance is written for a reader who applies it to their own position. Pass a portfolio to have the trader, the risk analysts and the portfolio manager work against your actual book.
+
+```python
+from tradingagents.portfolio import PortfolioContext
+
+portfolio = PortfolioContext.model_validate({
+    "cash": 25000.0,
+    "currency": "USD",
+    "positions": [{"ticker": "NVDA", "quantity": 120, "average_price": 150.0}],
+})
+_, decision = ta.propagate("NVDA", "2026-09-01", portfolio=portfolio)
+```
+
+The CLI takes the same content as a JSON file: `tradingagents --portfolio my_book.json`.
+
+An empty `positions` list means a flat book, which is different from passing nothing. A run without a portfolio is never treated as flat.
 
 ## Persistence and Recovery
 
@@ -251,16 +296,37 @@ Checkpoint resume is opt-in via `--checkpoint`. When enabled, LangGraph saves st
 Per-ticker SQLite databases live at `~/.tradingagents/cache/checkpoints/<TICKER>.db` (override the base with `TRADINGAGENTS_CACHE_DIR`). Use `--clear-checkpoints` to reset all of them before a run.
 
 ```bash
-tradingagents analyze --checkpoint           # enable for this run
-tradingagents analyze --clear-checkpoints    # reset before running
+tradingagents --checkpoint           # enable for this run
+tradingagents --clear-checkpoints    # reset before running
 ```
 
 ```python
 config = DEFAULT_CONFIG.copy()
 config["checkpoint_enabled"] = True
 ta = TradingAgentsGraph(config=config)
-_, decision = ta.propagate("NVDA", "2026-01-15")
+_, decision = ta.propagate("NVDA", "2026-09-01")
 ```
+
+## Evaluating decisions over time
+
+One run gives one decision, which cannot tell you whether the system decides well. `run_backtest` runs the same pipeline over a grid of tickers and dates, writes to a decision log of its own, and scores the decisions whose holding window has since traded.
+
+```python
+from tradingagents.backtest import iter_grid, run_backtest, summarize
+from tradingagents.agents.utils.memory import TradingMemoryLog
+
+dates = iter_grid("2026-06-01", "2026-08-01", every_n_days=7)
+result = run_backtest(["NVDA", "AAPL"], dates, config, selected_analysts=["market", "news"])
+print(summarize(TradingMemoryLog({"memory_log_path": str(result.log_path)})).render())
+```
+
+From the CLI:
+
+```bash
+tradingagents backtest NVDA,AAPL --start 2026-06-01 --end 2026-08-01 --every 7
+```
+
+Each cell is scored on realized alpha against the instrument's regional benchmark, grouped by rating. Your own decision log is never written to, and re-running the same grid with `run_id=result.run_id` skips the cells that already ran, so an interrupted sweep continues where it stopped.
 
 ## Reproducibility
 

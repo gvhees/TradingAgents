@@ -136,6 +136,23 @@ class TestTradingMemoryLogCore:
         log.store_decision("NVDA", "2026-01-10", DECISION_BUY)
         assert len(log.load_entries()) == 1
 
+    def test_store_decision_idempotent_after_the_entry_resolves(self, tmp_path):
+        """A settled entry still blocks a duplicate.
+
+        The guard matched only pending entries, so re-running a ticker and date
+        whose outcome had already been settled appended a second entry: the same
+        decision counted twice in past context and in any aggregate over the log.
+        """
+        log = make_log(tmp_path)
+        log.store_decision("NVDA", "2026-01-10", DECISION_BUY)
+        log.update_with_outcome("NVDA", "2026-01-10", 0.05, 0.02, 5, "worked", "2026-01-17")
+
+        log.store_decision("NVDA", "2026-01-10", DECISION_BUY)
+
+        entries = log.load_entries()
+        assert len(entries) == 1
+        assert entries[0]["pending"] is False  # the settled record is kept, not replaced
+
     def test_batch_update_resolves_multiple_entries(self, tmp_path):
         """batch_update_with_outcomes resolves multiple pending entries in one write."""
         log = make_log(tmp_path)
@@ -176,10 +193,14 @@ class TestTradingMemoryLogCore:
         log.store_decision("AAPL", "2026-01-11", DECISION_OVERWEIGHT)
         assert log.load_entries()[0]["rating"] == "Overweight"
 
-    def test_rating_fallback_hold(self, tmp_path):
+    def test_an_unreadable_decision_is_tagged_for_review(self, tmp_path):
+        """Not a Hold: a fabricated rating is quoted back to the next run as a
+        call that was never made, and counted in the backtest figures."""
+        from tradingagents.agents.utils.rating import RATING_REVIEW
+
         log = make_log(tmp_path)
         log.store_decision("MSFT", "2026-01-12", DECISION_NO_RATING)
-        assert log.load_entries()[0]["rating"] == "Hold"
+        assert log.load_entries()[0]["rating"] == RATING_REVIEW
 
     def test_rating_priority_over_prose(self, tmp_path):
         """'Rating: X' label wins even when an opposing rating word appears earlier in prose."""
@@ -589,6 +610,13 @@ class TestDeferredReflection:
         assert TradingAgentsGraph._resolve_benchmark(mock_graph, "RELIANCE.NS") == "^NSEI"
         assert TradingAgentsGraph._resolve_benchmark(mock_graph, "AZN.L") == "^FTSE"
 
+    def test_explicit_benchmark_is_resolved_like_any_other_symbol(self):
+        """A configured benchmark takes the same alias mapping as the ticker, or
+        the return lookup finds nothing and the decision never settles."""
+        mock_graph = MagicMock(spec=TradingAgentsGraph)
+        mock_graph.config = {"benchmark_ticker": "SPX500", "benchmark_map": {"": "SPY"}}
+        assert TradingAgentsGraph._resolve_benchmark(mock_graph, "NVDA") == "^GSPC"
+
     def test_resolve_benchmark_china_a_shares(self):
         """A-share tickers route to their exchange composite (uses the real
         default benchmark_map, since A-share support relies on it)."""
@@ -598,6 +626,8 @@ class TestDeferredReflection:
                              "benchmark_map": DEFAULT_CONFIG["benchmark_map"]}
         assert TradingAgentsGraph._resolve_benchmark(mock_graph, "600519.SS") == "000001.SS"
         assert TradingAgentsGraph._resolve_benchmark(mock_graph, "000001.SZ") == "399001.SZ"
+        # .SH is the exchange's own suffix; Yahoo spells Shanghai .SS (#1260)
+        assert TradingAgentsGraph._resolve_benchmark(mock_graph, "600519.SH") == "000001.SS"
 
     def test_resolve_benchmark_us_ticker_defaults_to_spy(self):
         """US tickers (no dotted suffix) take the empty-suffix entry."""
@@ -903,8 +933,44 @@ class TestLegacyRemoval:
         mock_graph._run_graph = functools.partial(
             TradingAgentsGraph._run_graph, mock_graph
         )
+        mock_graph.record_decision = functools.partial(
+            TradingAgentsGraph.record_decision, mock_graph
+        )
         TradingAgentsGraph.propagate(mock_graph, "NVDA", "2026-01-10")
         entries = mock_graph.memory_log.load_entries()
         assert len(entries) == 1
         assert entries[0]["ticker"] == "NVDA"
         assert entries[0]["pending"] is True
+
+
+@pytest.mark.unit
+def test_a_failed_reflection_leaves_the_entry_pending_and_lets_the_run_start(tmp_path, monkeypatch):
+    """Settling past decisions happens on the way into a new run, and reflection
+    calls an LLM. A transient failure there must not stop the new analysis."""
+    from tradingagents.agents.utils.memory import TradingMemoryLog
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+    graph = object.__new__(TradingAgentsGraph)
+    graph.config = {"memory_log_path": str(tmp_path / "m.md")}
+    graph.memory_log = TradingMemoryLog(graph.config)
+    graph.memory_log.store_decision("NVDA", "2026-01-05", "Rating: Buy\n\nx")
+    graph.memory_log.store_decision("NVDA", "2026-01-12", "Rating: Sell\n\ny")
+    monkeypatch.setattr(graph, "_resolve_benchmark", lambda t: "SPY", raising=False)
+    monkeypatch.setattr(graph, "_fetch_returns",
+                        lambda t, d, benchmark=None: (0.01, 0.005, 5, "2026-01-19"), raising=False)
+
+    class _Reflector:
+        calls = 0
+
+        def reflect_on_final_decision(self, **kw):
+            _Reflector.calls += 1
+            if _Reflector.calls == 1:
+                raise RuntimeError("provider timed out")
+            return "second one worked"
+
+    graph.reflector = _Reflector()
+
+    graph._resolve_pending_entries("NVDA")  # must not raise
+
+    entries = graph.memory_log.load_entries()
+    assert [e["pending"] for e in entries] == [True, False]  # the failed one waits for next time
